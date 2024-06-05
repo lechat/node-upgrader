@@ -76,39 +76,13 @@ def upgrade_nodegroup_ami_version(eks_client, cluster_name, nodegroup_name):
         )
 
 
-def check_upgrade_status(eks_client, cluster_name, nodegroup_name, update_id):
-    try:
-        response = eks_client.describe_update(
-            name=cluster_name, updateId=update_id, nodegroupName=nodegroup_name
-        )
-        status = response["update"]["status"]
-        if status == "InProgress":
-            return False, None
-        elif status == "Failed":
-            return (
-                True,
-                f"Upgrade failed for nodegroup {nodegroup_name} in cluster {cluster_name}",
-            )
-        elif status == "Successful":
-            return (
-                True,
-                f"Successfully upgraded nodegroup {nodegroup_name} in cluster {cluster_name}",
-            )
-    except Exception as e:
-        return (
-            True,
-            f"Error checking upgrade status for nodegroup {nodegroup_name} in cluster {cluster_name}: {e}",
-        )
-
-    return False, None
-
-
 def process_region_for_account(account_id, region, role_name):
     if shutdown_flag.is_set():
         print(
-            f"Shutdown flag set, skipping processing for account {account_id} in region {region}"
+            f"Shutdown flag set, skipping processing for account {account_id} "
+            f"in region {region}"
         )
-        return
+        return []
 
     credentials = assume_role(account_id, role_name)
     eks_client = boto3.client(
@@ -120,12 +94,14 @@ def process_region_for_account(account_id, region, role_name):
     )
     try:
         clusters = eks_client.list_clusters()["clusters"]
+        results = []
         for cluster in clusters:
             if shutdown_flag.is_set():
                 print(
-                    f"Shutdown flag set, stopping processing for cluster {cluster} in account {account_id} region {region}"
+                    f"Shutdown flag set, stopping processing for cluster "
+                    f"{cluster} in account {account_id} region {region}"
                 )
-                return
+                return []
 
             nodegroups = eks_client.list_nodegroups(clusterName=cluster)[
                 "nodegroups"
@@ -140,38 +116,67 @@ def process_region_for_account(account_id, region, role_name):
                     )
                     if update_id:
                         print(
-                            f"Successfully initiated upgrade for nodegroup {nodegroup} in cluster {cluster} in region {region} for account {account_id}"
+                            f"Successfully initiated upgrade for nodegroup "
+                            f"{nodegroup} in cluster {cluster} in region {region} "
+                            f"for account {account_id}"
                         )
-                        yield (eks_client, cluster, nodegroup, update_id)
+                        results.append(
+                            (eks_client, cluster, nodegroup, update_id)
+                        )
+        return results
     except Exception as e:
         print(
             f"Error processing region {region} for account {account_id}: {e}"
         )
+        return []
+
+
+def check_upgrade_status(eks_client, cluster_name, nodegroup_name, update_id):
+    try:
+        response = eks_client.describe_update(
+            name=cluster_name, updateId=update_id, nodegroupName=nodegroup_name
+        )
+        status = response["update"]["status"]
+        if status == "InProgress":
+            return False, None
+        elif status == "Failed":
+            return True, (
+                f"Upgrade failed for nodegroup {nodegroup_name} in "
+                f"cluster {cluster_name}"
+            )
+        elif status == "Successful":
+            return True, (
+                f"Successfully upgraded nodegroup {nodegroup_name} in "
+                f"cluster {cluster_name}"
+            )
+    except Exception as e:
+        return True, (
+            f"Error checking upgrade status for nodegroup {nodegroup_name} in "
+            f"cluster {cluster_name}: {e}"
+        )
+
+    return False, None
 
 
 def main(role_name="OrganizationAccountAccessRole"):
-    accounts_to_process = get_accounts()
-    accounts_to_skip = get_skip_accounts()
-
-    # Create a set of (account, region) pairs to skip for quick lookup
-    skip_set = {
-        (account["account"], account["region"]) for account in accounts_to_skip
-    }
+    accounts_to_process = mock_get_accounts()
+    accounts_to_skip = mock_get_skip_accounts()
 
     # Report accounts to be skipped
-    for account_id, region in skip_set:
-        print(f"Skipping account {account_id} in region {region}")
+    for account in accounts_to_skip:
+        print(
+            f"Skipping account {account['account']} in region {account['region']}"
+        )
 
     # Filter out the accounts to be skipped
     filtered_accounts = [
         account_info
         for account_info in accounts_to_process
-        if (account_info["account"], account_info["region"]) not in skip_set
+        if account_info not in accounts_to_skip
     ]
 
     with ThreadPoolExecutor(max_workers=10) as executor:
         futures = []
-        status_futures = []
 
         for account_info in filtered_accounts:
             account_id = account_info["account"]
@@ -183,30 +188,22 @@ def main(role_name="OrganizationAccountAccessRole"):
             )
 
         # Continuously check the status of nodegroup updates
-        while any([futures, status_futures]):
-            # Check for new results from the region processing
+        while futures:
+            # Check for new results from the processing
             for future in as_completed(futures):
                 if shutdown_flag.is_set():
                     print("Shutdown flag set, cancelling remaining futures...")
                     for future in futures:
                         future.cancel()
+                    futures.clear()
                     break
+
                 try:
-                    for (
-                        eks_client,
-                        cluster,
-                        nodegroup,
-                        update_id,
-                    ) in future.result():
-                        status_futures.append(
-                            (
-                                executor.submit(
-                                    check_upgrade_status,
-                                    eks_client,
-                                    cluster,
-                                    nodegroup,
-                                    update_id,
-                                ),
+                    results = future.result()
+                    for eks_client, cluster, nodegroup, update_id in results:
+                        futures.append(
+                            executor.submit(
+                                check_upgrade_status,
                                 eks_client,
                                 cluster,
                                 nodegroup,
@@ -215,41 +212,10 @@ def main(role_name="OrganizationAccountAccessRole"):
                         )
                 except Exception as e:
                     print(f"Exception occurred: {e}")
+
                 futures.remove(future)
 
-            # Check for new results from the status check
-            for (
-                future,
-                eks_client,
-                cluster,
-                nodegroup,
-                update_id,
-            ) in status_futures:
-                if future.done():
-                    finished, message = future.result()
-                    if finished:
-                        print(message)
-                        status_futures.remove(
-                            (future, eks_client, cluster, nodegroup, update_id)
-                        )
-                    else:
-                        # Resubmit the status check for this nodegroup
-                        status_futures.append(
-                            (
-                                executor.submit(
-                                    check_upgrade_status,
-                                    eks_client,
-                                    cluster,
-                                    nodegroup,
-                                    update_id,
-                                ),
-                                eks_client,
-                                cluster,
-                                nodegroup,
-                                update_id,
-                            )
-                        )
-                time.sleep(5)
+            time.sleep(5)
 
 
 if __name__ == "__main__":
